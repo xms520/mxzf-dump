@@ -158,6 +158,14 @@ static BOOL mx_cache_images(BOOL rebuild) {
 static BOOL mx_name_safe(const char *s) {
     return s && mx_readable(s, 8);
 }
+// v1.5 白名单扫描：只枚举热更候选 image（Assembly-CSharp*/AotUpdate*），
+// 其余 AOT image（mscorlib/System/Unity*）一律不碰 —— 它们的类用 il2cpp_class_from_name 精确查询，
+// 且仅当该 image 的 typeCount 与游戏发布 metadata 一致（稳定态）才允许。
+static BOOL mx_hot_image(const char *inm) {
+    if (!inm) return NO;
+    return !strncmp(inm, "Assembly-CSharp", 15) && strcmp(inm, "Assembly-CSharp-firstpass.dll")
+        || !strncmp(inm, "AotUpdate", 9);
+}
 static void *mx_scan_all(const char *ns, const char *name) {
     if (!ns) ns = "";
     if (!mx_cache_images(NO)) return NULL;
@@ -165,24 +173,31 @@ static void *mx_scan_all(const char *ns, const char *name) {
     for (size_t i = 0; i < g_imgCount; i++) {
         void *img = g_imgList[i];
         if (!img || !mx_readable(img, 0x40)) continue;
-        // image 内部结构探针（2022.3 v29 布局）：name@0x00 typeStart@0x18 typeCount@0x20
         const char *inm = *(const char* const*)img;
         if (!mx_name_safe(inm)) continue;
+        // 只枚举热更 image；系统/AOT image 走精确 class_from_name（它们启动即稳定）
+        BOOL hot = mx_hot_image(inm);
         int32_t tStart = *(int32_t*)((char*)img + 0x18);
         int32_t tCnt   = *(int32_t*)((char*)img + 0x20);
-        if (tCnt <= 0 || tCnt > 65536 || tStart < 0) continue;   // 半初始化过滤
-        int cnt = (int)((int(*)(void*))p_image_get_class_count)(img);
-        if (cnt != tCnt) continue;
-        for (int k = 0; k < cnt; k++) {
-            void *cls = ((void*(*)(void*,int))p_image_get_class)(img, k);
-            if (!cls || !mx_readable(cls, 0x20)) continue;
-            const char *cn = ((const char*(*)(void*))p_class_get_name)(cls);
-            if (!mx_name_safe(cn) || strcmp(cn, name)) continue;
-            const char *cns = p_class_get_namespace ? ((const char*(*)(void*))p_class_get_namespace)(cls) : "";
-            if (!mx_name_safe(cns)) cns = "";
-            if (strcmp(cns, ns)) continue;
-            if (!strcmp(name, "BattleElementCenter")) g_imgBE = img;
-            return cls;
+        if (tCnt <= 0 || tCnt > 65536 || tStart < 0) continue;
+        if (hot) {
+            for (int k = 0; k < (int)tCnt; k++) {
+                void *cls = ((void*(*)(void*,int))p_image_get_class)(img, k);
+                if (!cls || !mx_readable(cls, 0x20)) continue;
+                const char *cn = ((const char*(*)(void*))p_class_get_name)(cls);
+                if (!mx_name_safe(cn) || strcmp(cn, name)) continue;
+                const char *cns = p_class_get_namespace ? ((const char*(*)(void*))p_class_get_namespace)(cls) : "";
+                if (!mx_name_safe(cns)) cns = "";
+                if (strcmp(cns, ns)) continue;
+                if (!strcmp(name, "BattleElementCenter")) g_imgBE = img;
+                return cls;
+            }
+        } else {
+            void *c = ((void*(*)(void*,const char*,const char*))p_class_from_name)(img, ns, name);
+            if (c) {
+                if (!strcmp(name, "BattleElementCenter")) g_imgBE = img;
+                return c;
+            }
         }
     }
     return NULL;
@@ -225,8 +240,20 @@ static void *g_mIGOData, *m_SetHPNow, *g_mGetHPMax, *g_mInvincible, *g_mGetCamp;
 static void *g_mSetPickAll, *g_mSetLocalDmg, *g_mSetNoMiss, *g_mTimeSet;
 static int g_resolveTry = 0;
 static BOOL g_resolved = NO;
+static uint64_t g_bootMs = 0;   // 注入时刻
+static BOOL g_phase2 = NO;      // 60s 后进入安全扫描期
 
 static BOOL mx_resolve(void) {
+    // v1.5 门禁：启动 60s 内 il2cpp 全局 metadata 在 HybridCLR 初始化中变化，
+    // 枚举任何 image 都可能踩坏栈（v1.3/v1.4 .ips 实证）。60s 后游戏已进主城，热更 dll 必已加载。
+    if (g_bootMs == 0) g_bootMs = (uint64_t)([[NSProcessInfo processInfo] systemUptime] * 1000.0);
+    uint64_t now = (uint64_t)([[NSProcessInfo processInfo] systemUptime] * 1000.0);
+    if (!g_phase2 && now - g_bootMs < 60000) {
+        static int gateLog = 0;
+        if (gateLog++ < 3) mlog(@"boot guard: waiting (%llu ms)", (unsigned long long)(now - g_bootMs));
+        return NO;
+    }
+    if (!g_phase2) { g_phase2 = YES; mlog(@"boot guard passed, scanning starts"); }
     g_resolveTry++;
     if (g_resolveTry == 1 || g_resolveTry % 20 == 0) mlog(@"resolve try #%d", g_resolveTry);
 
