@@ -40,6 +40,7 @@ static void *p_domain_get, *p_domain_get_assemblies, *p_assembly_get_image, *p_i
 static void *p_class_from_name, *p_class_get_field_from_name, *p_class_get_method_from_name;
 static void *p_field_get_offset, *p_field_static_get_value, *p_runtime_invoke;
 static void *p_object_get_class, *p_class_get_name;
+static void *p_image_get_class_count, *p_image_get_class, *p_class_get_namespace;
 
 static BOOL load_il2cpp_api(void) {
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
@@ -62,6 +63,9 @@ static BOOL load_il2cpp_api(void) {
     p_runtime_invoke             = dlsym(g_uf, "il2cpp_runtime_invoke");
     p_object_get_class           = dlsym(g_uf, "il2cpp_object_get_class");
     p_class_get_name             = dlsym(g_uf, "il2cpp_class_get_name");
+    p_image_get_class_count      = dlsym(g_uf, "il2cpp_image_get_class_count");
+    p_image_get_class            = dlsym(g_uf, "il2cpp_image_get_class");
+    p_class_get_namespace        = dlsym(g_uf, "il2cpp_class_get_namespace");
     return p_runtime_invoke && p_class_from_name && p_domain_get && p_field_static_get_value;
 }
 
@@ -148,16 +152,37 @@ static BOOL mx_cache_images(BOOL rebuild) {
     g_imgList = imgs; g_imgCount = c;
     return YES;
 }
+// v1.4 安全扫描：不用 il2cpp_class_from_name（半初始化 image 会崩），
+// 改用官方枚举 API image_get_class_count + image_get_class 逐类比对类名/命名空间。
+// count 合法性校验 + 类指针探针双保险。
+static BOOL mx_name_safe(const char *s) {
+    return s && mx_readable(s, 8);
+}
 static void *mx_scan_all(const char *ns, const char *name) {
     if (!ns) ns = "";
     if (!mx_cache_images(NO)) return NULL;
+    if (!p_image_get_class_count || !p_image_get_class || !p_class_get_name) return NULL;
     for (size_t i = 0; i < g_imgCount; i++) {
         void *img = g_imgList[i];
-        if (!img || !mx_readable(img, 0x40)) continue;   // 半初始化 image 跳过
-        void *c = mx_cls(img, ns, name);
-        if (c) {
+        if (!img || !mx_readable(img, 0x40)) continue;
+        // image 内部结构探针（2022.3 v29 布局）：name@0x00 typeStart@0x18 typeCount@0x20
+        const char *inm = *(const char* const*)img;
+        if (!mx_name_safe(inm)) continue;
+        int32_t tStart = *(int32_t*)((char*)img + 0x18);
+        int32_t tCnt   = *(int32_t*)((char*)img + 0x20);
+        if (tCnt <= 0 || tCnt > 65536 || tStart < 0) continue;   // 半初始化过滤
+        int cnt = (int)((int(*)(void*))p_image_get_class_count)(img);
+        if (cnt != tCnt) continue;
+        for (int k = 0; k < cnt; k++) {
+            void *cls = ((void*(*)(void*,int))p_image_get_class)(img, k);
+            if (!cls || !mx_readable(cls, 0x20)) continue;
+            const char *cn = ((const char*(*)(void*))p_class_get_name)(cls);
+            if (!mx_name_safe(cn) || strcmp(cn, name)) continue;
+            const char *cns = p_class_get_namespace ? ((const char*(*)(void*))p_class_get_namespace)(cls) : "";
+            if (!mx_name_safe(cns)) cns = "";
+            if (strcmp(cns, ns)) continue;
             if (!strcmp(name, "BattleElementCenter")) g_imgBE = img;
-            return c;
+            return cls;
         }
     }
     return NULL;
@@ -241,13 +266,14 @@ static BOOL mx_resolve(void) {
         if (!g_clsTime)  g_clsTime    = mx_scan_all("UnityEngine", "Time");
         if (!g_clsBE || !g_clsGOM) {
             if (g_resolveTry % 20 == 0) {
-                mlog(@"cls miss be=%p gom=%p imgs=%zu (hotupdate dll not loaded yet?)", g_clsBE, g_clsGOM, g_imgCount);
-                // 列出全部 image 名（含后加载的热更程序集）
+                mlog(@"cls miss be=%p gom=%p imgs=%zu", g_clsBE, g_clsGOM, g_imgCount);
                 if (mx_cache_images(YES)) {
                     NSMutableString *all = [NSMutableString string];
                     for (size_t i = 0; i < g_imgCount; i++) {
-                        const char *nm2 = ((const char*(*)(void*))p_image_get_name)(g_imgList[i]);
-                        if (nm2) [all appendFormat:@"%s ", nm2];
+                        void *im = g_imgList[i];
+                        const char *nm2 = im ? ((const char*(*)(void*))p_image_get_name)(im) : NULL;
+                        int32_t tc = (im && mx_readable(im, 0x28)) ? *(int32_t*)((char*)im + 0x20) : -1;
+                        [all appendFormat:@"%s(%d) ", nm2 ?: "?", tc];
                     }
                     mlog(@"images: %@", all);
                 }
