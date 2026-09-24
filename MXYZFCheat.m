@@ -123,11 +123,13 @@ static void *mx_fptr(void *cls, const char *fname) {
     return cls ? ((void*(*)(void*,const char*))p_class_get_field_from_name)(cls, fname) : NULL;
 }
 
-// 全 image 扫描：HybridCLR 热更类可能注册在任意 image（Assembly-CSharp 主 image 名不确定）
+// 全 image 扫描：HybridCLR 热更类注册在运行时加载的 image（名带 .dll 后缀）
+// ⚠️ 热更程序集在游戏启动流程中后加载，image 列表不能永久缓存——rebuild=1 强制重建
 static void **g_imgList = NULL;
 static size_t g_imgCount = 0;
-static BOOL mx_cache_images(void) {
-    if (g_imgList) return YES;
+static void *g_imgBE = NULL;   // BattleElementCenter 所在 image（诊断）
+static BOOL mx_cache_images(BOOL rebuild) {
+    if (g_imgList && !rebuild) return YES;
     void *dom = ((void*(*)())p_domain_get)();
     if (!dom) return NO;
     size_t n = 0;
@@ -140,14 +142,18 @@ static BOOL mx_cache_images(void) {
         void *img = ((void*(*)(void*))p_assembly_get_image)(list[i]);
         if (img) imgs[c++] = img;
     }
+    if (c == 0) return NO;
     g_imgList = imgs; g_imgCount = c;
     return YES;
 }
 static void *mx_scan_all(const char *ns, const char *name) {
-    if (!mx_cache_images()) return NULL;
+    if (!mx_cache_images(NO)) return NULL;
     for (size_t i = 0; i < g_imgCount; i++) {
         void *c = mx_cls(g_imgList[i], ns, name);
-        if (c) return c;
+        if (c) {
+            if (!strcmp(name, "BattleElementCenter")) g_imgBE = g_imgList[i];
+            return c;
+        }
     }
     return NULL;
 }
@@ -207,27 +213,20 @@ static BOOL mx_resolve(void) {
             if (!img) continue;
             const char *nm = ((const char*(*)(void*))p_image_get_name)(img);
             if (!nm) continue;
-            // 精确匹配 Assembly-CSharp.dll；排除 Assembly-CSharp-firstpass
-            if (!strcmp(nm, "Assembly-CSharp")) g_imgMain = img;
-            else if (!strcmp(nm, "Assembly-CSharp-firstpass")) imgFP = img;
+            // 运行时 image 名带 .dll 后缀；HybridCLR 热更程序集名不定 —— 只精确排除 firstpass
+            if (!strcmp(nm, "Assembly-CSharp-firstpass.dll") || !strcmp(nm, "Assembly-CSharp-firstpass")) imgFP = img;
+            else if (!strcmp(nm, "Assembly-CSharp.dll") || !strcmp(nm, "Assembly-CSharp")) g_imgMain = img;
         }
-        if (!g_imgMain) {
-            if (g_resolveTry % 20 == 0) {
-                NSMutableString *all = [NSMutableString string];
-                for (size_t i = 0; i < n && i < 60; i++) {
-                    void *img2 = ((void*(*)(void*))p_assembly_get_image)(list[i]);
-                    const char *nm2 = img2 ? ((const char*(*)(void*))p_image_get_name)(img2) : NULL;
-                    if (nm2) [all appendFormat:@"%s ", nm2];
-                }
-                mlog(@"Assembly-CSharp miss (fp=%p), images: %@", imgFP, all);
-            }
-            return NO;
-        }
-        mlog(@"Assembly-CSharp image ok (fp=%p)", imgFP);
+        // 【v1.2】image 名 gate 只作诊断——热更主程序集名运行时不一定叫 Assembly-CSharp(.dll)
+        // 找不到也放行，全扫描负责真正定位
+        if (g_imgMain) mlog(@"Assembly-CSharp image ok (fp=%p)", imgFP);
+        else if (g_resolveTry % 20 == 0) mlog(@"Assembly-CSharp gate miss (fp=%p) -> full-scan path", imgFP);
     }
 
     if (!g_clsBE) {
-        // 热更类可能注册在任意 image —— 全 image 兜底扫描
+        // 热更类可能注册在任意 image —— 全 image 兜底扫描（不 gate image 名）
+        // ⚠️ HybridCLR 运行时 image 名带 .dll 后缀（Assembly-CSharp.dll）；
+        //    热更 dll 后加载，image 列表必须失败时重建（不能永久缓存）
         if (!g_clsBE)    g_clsBE      = mx_scan_all("ActionGameLibrary", "BattleElementCenter");
         if (!g_clsGOM)   g_clsGOM     = mx_scan_all("ActionGameLibrary", "GameObjectManager");
         if (!g_clsIGO)   g_clsIGO     = mx_scan_all("ActionGameLibrary", "InteractiveGameObject");
@@ -236,13 +235,28 @@ static BOOL mx_resolve(void) {
         if (!g_clsDropMgr) g_clsDropMgr = mx_scan_all(NULL, "BattleDropManager");
         if (!g_clsTime)  g_clsTime    = mx_scan_all("UnityEngine", "Time");
         if (!g_clsBE || !g_clsGOM) {
-            if (g_resolveTry % 20 == 0) mlog(@"cls miss be=%p gom=%p", g_clsBE, g_clsGOM);
+            if (g_resolveTry % 20 == 0) {
+                mlog(@"cls miss be=%p gom=%p imgs=%zu (hotupdate dll not loaded yet?)", g_clsBE, g_clsGOM, g_imgCount);
+                // 列出全部 image 名（含后加载的热更程序集）
+                if (mx_cache_images(YES)) {
+                    NSMutableString *all = [NSMutableString string];
+                    for (size_t i = 0; i < g_imgCount; i++) {
+                        const char *nm2 = ((const char*(*)(void*))p_image_get_name)(g_imgList[i]);
+                        if (nm2) [all appendFormat:@"%s ", nm2];
+                    }
+                    mlog(@"images: %@", all);
+                }
+            }
+            g_imgList = NULL;   // 强制下轮重建（等 HybridCLR 注册热更程序集）
+            g_imgMain = NULL;   // image 名 gate 失败也放行——直接走全扫描
             return NO;
         }
         if (!g_clsIGO || !g_clsIGOData || !g_clsSecAttr || !g_clsDropMgr || !g_clsTime) {
             if (g_resolveTry % 20 == 0) mlog(@"cls2 miss igo=%p igod=%p sa=%p drop=%p time=%p", g_clsIGO, g_clsIGOData, g_clsSecAttr, g_clsDropMgr, g_clsTime);
+            g_imgList = NULL;
             return NO;
         }
+        mlog(@"classes resolved: BE in image %s", ((const char*(*)(void*))p_image_get_name)(g_imgBE) ?: "?");
     }
 
     g_fGOM        = mx_fptr(g_clsBE, "gameObjectManager");   // STATIC GameObjectManager
