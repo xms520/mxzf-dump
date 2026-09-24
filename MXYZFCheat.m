@@ -113,7 +113,9 @@ static int   mx_box_int  (void *b) { return b ? *(int32_t*)((char*)b + 0x10) : 0
 static BOOL  mx_box_bool (void *b) { return b ? *(uint8_t*)((char*)b + 0x10) : 0; }
 
 static void *mx_cls(void *img, const char *ns, const char *name) {
-    if (!img) return NULL;
+    if (!img || !name) return NULL;
+    // ⚠️ il2cpp_class_from_name 对 ns=NULL 会 strcmp 解引用崩溃 —— NULL 必须转空串
+    if (!ns) ns = "";
     return ((void*(*)(void*,const char*,const char*))p_class_from_name)(img, ns, name);
 }
 static void *mx_meth(void *cls, const char *m, int argc) {
@@ -147,11 +149,14 @@ static BOOL mx_cache_images(BOOL rebuild) {
     return YES;
 }
 static void *mx_scan_all(const char *ns, const char *name) {
+    if (!ns) ns = "";
     if (!mx_cache_images(NO)) return NULL;
     for (size_t i = 0; i < g_imgCount; i++) {
-        void *c = mx_cls(g_imgList[i], ns, name);
+        void *img = g_imgList[i];
+        if (!img || !mx_readable(img, 0x40)) continue;   // 半初始化 image 跳过
+        void *c = mx_cls(img, ns, name);
         if (c) {
-            if (!strcmp(name, "BattleElementCenter")) g_imgBE = g_imgList[i];
+            if (!strcmp(name, "BattleElementCenter")) g_imgBE = img;
             return c;
         }
     }
