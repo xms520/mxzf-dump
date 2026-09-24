@@ -123,6 +123,35 @@ static void *mx_fptr(void *cls, const char *fname) {
     return cls ? ((void*(*)(void*,const char*))p_class_get_field_from_name)(cls, fname) : NULL;
 }
 
+// 全 image 扫描：HybridCLR 热更类可能注册在任意 image（Assembly-CSharp 主 image 名不确定）
+static void **g_imgList = NULL;
+static size_t g_imgCount = 0;
+static BOOL mx_cache_images(void) {
+    if (g_imgList) return YES;
+    void *dom = ((void*(*)())p_domain_get)();
+    if (!dom) return NO;
+    size_t n = 0;
+    void **list = ((void**(*)(void*,size_t*))p_domain_get_assemblies)(dom, &n);
+    if (!list) return NO;
+    static void *imgs[512];
+    size_t c = 0;
+    for (size_t i = 0; i < n && c < 512; i++) {
+        if (!list[i]) continue;
+        void *img = ((void*(*)(void*))p_assembly_get_image)(list[i]);
+        if (img) imgs[c++] = img;
+    }
+    g_imgList = imgs; g_imgCount = c;
+    return YES;
+}
+static void *mx_scan_all(const char *ns, const char *name) {
+    if (!mx_cache_images()) return NULL;
+    for (size_t i = 0; i < g_imgCount; i++) {
+        void *c = mx_cls(g_imgList[i], ns, name);
+        if (c) return c;
+    }
+    return NULL;
+}
+
 // 值类型参数环形缓冲（runtime_invoke 值类型 = 未装箱数据指针，非装箱对象）
 static int64_t g_al[16]; static int g_aln = 0;
 static int32_t g_ai[16]; static int g_ain = 0;
@@ -171,36 +200,41 @@ static BOOL mx_resolve(void) {
         size_t n = 0;
         void **list = ((void**(*)(void*,size_t*))p_domain_get_assemblies)(dom, &n);
         if (!list) return NO;
+        void *imgFP = NULL;   // Assembly-CSharp-firstpass（必须排除）
         for (size_t i = 0; i < n; i++) {
             if (!list[i]) continue;
             void *img = ((void*(*)(void*))p_assembly_get_image)(list[i]);
             if (!img) continue;
             const char *nm = ((const char*(*)(void*))p_image_get_name)(img);
-            if (nm && !strncmp(nm, "Assembly-CSharp", 15)) g_imgMain = img;
+            if (!nm) continue;
+            // 精确匹配 Assembly-CSharp.dll；排除 Assembly-CSharp-firstpass
+            if (!strcmp(nm, "Assembly-CSharp")) g_imgMain = img;
+            else if (!strcmp(nm, "Assembly-CSharp-firstpass")) imgFP = img;
         }
         if (!g_imgMain) {
             if (g_resolveTry % 20 == 0) {
                 NSMutableString *all = [NSMutableString string];
-                for (size_t i = 0; i < n && i < 40; i++) {
+                for (size_t i = 0; i < n && i < 60; i++) {
                     void *img2 = ((void*(*)(void*))p_assembly_get_image)(list[i]);
                     const char *nm2 = img2 ? ((const char*(*)(void*))p_image_get_name)(img2) : NULL;
                     if (nm2) [all appendFormat:@"%s ", nm2];
                 }
-                mlog(@"Assembly-CSharp miss, images: %@", all);
+                mlog(@"Assembly-CSharp miss (fp=%p), images: %@", imgFP, all);
             }
             return NO;
         }
-        mlog(@"Assembly-CSharp image ok");
+        mlog(@"Assembly-CSharp image ok (fp=%p)", imgFP);
     }
 
     if (!g_clsBE) {
-        g_clsBE      = mx_cls(g_imgMain, "ActionGameLibrary", "BattleElementCenter");
-        g_clsGOM     = mx_cls(g_imgMain, "ActionGameLibrary", "GameObjectManager");
-        g_clsIGO     = mx_cls(g_imgMain, "ActionGameLibrary", "InteractiveGameObject");
-        g_clsIGOData = mx_cls(g_imgMain, "ActionGameLibrary", "InteractiveGameObjectData");
-        g_clsSecAttr = mx_cls(g_imgMain, "ActionGameLibrary", "SecondaryAttribute");
-        g_clsDropMgr = mx_cls(g_imgMain, "", "BattleDropManager");
-        g_clsTime    = mx_cls(g_imgMain, "UnityEngine", "Time");
+        // 热更类可能注册在任意 image —— 全 image 兜底扫描
+        if (!g_clsBE)    g_clsBE      = mx_scan_all("ActionGameLibrary", "BattleElementCenter");
+        if (!g_clsGOM)   g_clsGOM     = mx_scan_all("ActionGameLibrary", "GameObjectManager");
+        if (!g_clsIGO)   g_clsIGO     = mx_scan_all("ActionGameLibrary", "InteractiveGameObject");
+        if (!g_clsIGOData) g_clsIGOData = mx_scan_all("ActionGameLibrary", "InteractiveGameObjectData");
+        if (!g_clsSecAttr) g_clsSecAttr = mx_scan_all("ActionGameLibrary", "SecondaryAttribute");
+        if (!g_clsDropMgr) g_clsDropMgr = mx_scan_all(NULL, "BattleDropManager");
+        if (!g_clsTime)  g_clsTime    = mx_scan_all("UnityEngine", "Time");
         if (!g_clsBE || !g_clsGOM) {
             if (g_resolveTry % 20 == 0) mlog(@"cls miss be=%p gom=%p", g_clsBE, g_clsGOM);
             return NO;
