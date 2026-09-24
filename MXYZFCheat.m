@@ -255,9 +255,9 @@ static BOOL mx_resolve(void) {
 static atomic_int g_kill = 0;   // 秒杀
 static atomic_int g_inv  = 0;   // 无敌
 static atomic_int g_pick = 0;   // 自动拾取
-static volatile int g_spd = 0;  // 0=1x 1=2x 2=4x 3=8x
+static atomic_int g_spd = 0;  // 0=1x 1=2x 2=4x 3=8x
 static const float SPD_N[4] = {1.0f, 2.0f, 4.0f, 8.0f};
-static volatile int g_dbg = 0;  // 本地免伤调试开关(官方 set_localDamage(0)+NoMiss)
+static atomic_int g_dbg = 0;  // 本地免伤调试开关(官方 set_localDamage(0)+NoMiss)
 static int g_killCnt = 0, g_lastKilled = 0, g_lastLocked = 0;
 static int g_status = 0; // 0=未就绪 1=就绪 2=战斗中
 
@@ -346,7 +346,8 @@ static void mx_tick(void) {
         g_lastKilled = killed; g_lastLocked = locked;
 
         // 加速：Time.timeScale
-        if (g_spd >= 0) mx_invoke(g_mTimeSet, NULL, (void*[]){mx_argf(SPD_N[g_spd])});
+        int spdv = atomic_load(&g_spd);
+        if (spdv > 0) mx_invoke(g_mTimeSet, NULL, (void*[]){mx_argf(SPD_N[spdv])});
         // 拾取
         if (atomic_load(&g_pick)) mx_invoke(g_mSetPickAll, NULL, (void*[]){mx_argb(YES)});
         // 本地免伤调试
@@ -391,7 +392,7 @@ static void ui_refresh(void) {
         if (!g_bKill) return;
         [g_bKill setTitle:[NSString stringWithFormat:@"秒杀  %@", atomic_load(&g_kill) ? @"开" : @"关"] forState:UIControlStateNormal];
         [g_bInv  setTitle:[NSString stringWithFormat:@"无敌  %@", atomic_load(&g_inv) ? @"开" : @"关"] forState:UIControlStateNormal];
-        [g_bSpd  setTitle:[NSString stringWithFormat:@"加速  %gx", SPD_N[g_spd]] forState:UIControlStateNormal];
+        [g_bSpd  setTitle:[NSString stringWithFormat:@"加速  %gx", SPD_N[atomic_load(&g_spd)]] forState:UIControlStateNormal];
         [g_bPick setTitle:[NSString stringWithFormat:@"拾取  %@", atomic_load(&g_pick) ? @"开" : @"关"] forState:UIControlStateNormal];
         [g_bDbg  setTitle:[NSString stringWithFormat:@"免伤  %@", atomic_load(&g_dbg) ? @"开" : @"关"] forState:UIControlStateNormal];
         mx_set_on(g_bKill, atomic_load(&g_kill));
@@ -499,7 +500,7 @@ static void mx_make_ui(void) {
 - (void)tapMask { ui_toggle_panel(); }
 - (void)tapKill { atomic_fetch_xor(&g_kill, 1); mlog(@"kill -> %d", atomic_load(&g_kill)); ui_refresh(); }
 - (void)tapInv  { atomic_fetch_xor(&g_inv, 1);  mlog(@"inv -> %d",  atomic_load(&g_inv));  ui_refresh(); }
-- (void)tapSpd  { g_spd = (g_spd + 1) % 4; mlog(@"spd -> %gx", SPD_N[g_spd]); ui_refresh(); }
+- (void)tapSpd  { int nv = (atomic_load(&g_spd) + 1) % 4; atomic_store(&g_spd, nv); mlog(@"spd -> %gx", SPD_N[nv]); ui_refresh(); }
 - (void)tapPick { atomic_fetch_xor(&g_pick, 1); mlog(@"pick -> %d", atomic_load(&g_pick)); ui_refresh(); }
 - (void)tapDbg  { atomic_fetch_xor(&g_dbg, 1);  mlog(@"dbg -> %d",  atomic_load(&g_dbg));  ui_refresh(); }
 - (void)tapBall { ui_toggle_panel(); }
