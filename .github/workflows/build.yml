@@ -24,6 +24,7 @@ jobs:
             -framework Foundation \
             -framework UIKit \
             -framework CoreGraphics \
+            -framework QuartzCore \
             -dynamiclib \
             -fobjc-arc \
             -O2 \
