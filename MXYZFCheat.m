@@ -1,7 +1,7 @@
 // MXYZFCheat.m — 冒险与征途 悬浮助手（纯 UI 壳 v2）
 // 悬浮球 = 内嵌头像 + 抖音同款彩虹环，**独立 UIWindow 承载**（windowLevel 最高），
 // 游戏重建 window / 盖层都影响不到；空白区域触摸穿透游戏。
-// 面板：标题「昆哥儿科技」+ 左上角同款头像；面板外点击关闭。
+// 面板：标题「昆哥儿科技」+ 左上角同款头像；面板可整体拖动；面板外触摸穿透游戏（右上 ✕ 关闭）。
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 
@@ -103,6 +103,11 @@ static UIView     *g_panel  = nil;   // 面板 view（同 window）
 @end
 
 @interface MXBox : NSObject
+- (void)ballTap;
+- (void)ballDrag:(UIPanGestureRecognizer *)g;
+- (void)panelDrag:(UIPanGestureRecognizer *)g;
+- (void)closePanel;
+- (void)keepTick;
 @end
 @implementation MXBox
 + (instancetype)shared { static MXBox *b; static dispatch_once_t o; dispatch_once(&o, ^{ b = [self new]; }); return b; }
@@ -147,10 +152,29 @@ static UIView     *g_panel  = nil;   // 面板 view（同 window）
     sub.numberOfLines = 0;
     [g_panel addSubview:sub];
 
+    // 关闭按钮（右上角 ✕）
+    UIButton *close = [UIButton buttonWithType:UIButtonTypeCustom];
+    close.frame = CGRectMake(pw - 34, 8, 26, 26);
+    close.backgroundColor = mx_c(60, 64, 80, 0.9);
+    close.layer.cornerRadius = 13;
+    close.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    [close setTitle:@"✕" forState:UIControlStateNormal];
+    [close setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [close addTarget:[MXBox shared] action:@selector(closePanel) forControlEvents:UIControlEventTouchUpInside];
+    [g_panel addSubview:close];
+
+    // 面板拖动手势（整卡可拖）
+    UIPanGestureRecognizer *ppan = [[UIPanGestureRecognizer alloc] initWithTarget:[MXBox shared] action:@selector(panelDrag:)];
+    [g_panel addGestureRecognizer:ppan];
+
     [root addSubview:g_panel];
 }
 
-- (void)ballTap { [self togglePanel]; }
+- (void)closePanel {
+    if (g_panel) { [g_panel removeFromSuperview]; g_panel = nil; }
+}
+
+- (void)ballTap { if (g_panel) { [self closePanel]; return; } [self togglePanel]; }
 
 - (void)ballDrag:(UIPanGestureRecognizer *)g {
     UIView *v = g.view;
@@ -159,6 +183,18 @@ static UIView     *g_panel  = nil;   // 面板 view（同 window）
     CGRect b = v.superview.bounds;
     nc.x = MIN(MAX(nc.x, BALL_SIZE/2), b.size.width  - BALL_SIZE/2);
     nc.y = MIN(MAX(nc.y, BALL_SIZE/2), b.size.height - BALL_SIZE/2);
+    v.center = nc;
+    [g setTranslation:CGPointZero inView:v.superview];
+}
+
+// 面板拖动：跟手 + 边界钳制
+- (void)panelDrag:(UIPanGestureRecognizer *)g {
+    UIView *v = g.view;
+    CGPoint t = [g translationInView:v.superview];
+    CGPoint nc = CGPointMake(v.center.x + t.x, v.center.y + t.y);
+    CGRect b = v.superview.bounds;
+    nc.x = MIN(MAX(nc.x, v.bounds.size.width/2),  b.size.width  - v.bounds.size.width/2);
+    nc.y = MIN(MAX(nc.y, v.bounds.size.height/2), b.size.height - v.bounds.size.height/2);
     v.center = nc;
     [g setTranslation:CGPointZero inView:v.superview];
 }
