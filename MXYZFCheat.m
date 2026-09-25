@@ -41,6 +41,7 @@ static void *p_class_from_name, *p_class_get_field_from_name, *p_class_get_metho
 static void *p_field_get_offset, *p_field_static_get_value, *p_runtime_invoke;
 static void *p_object_get_class, *p_class_get_name;
 static void *p_image_get_class_count, *p_image_get_class, *p_class_get_namespace;
+static void *p_thread_attach;
 
 static BOOL load_il2cpp_api(void) {
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
@@ -232,7 +233,6 @@ static int g_resolveTry = 0;
 static BOOL g_resolved = NO;
 static BOOL g_bgStarted = NO;
 static int g_bgTries = 0;
-static void *p_thread_attach = NULL;
 static uint64_t g_bootMs = 0;   // 注入时刻
 static BOOL g_phase2 = NO;      // 60s 后进入安全扫描期
 
