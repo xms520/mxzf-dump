@@ -158,46 +158,30 @@ static BOOL mx_cache_images(BOOL rebuild) {
 static BOOL mx_name_safe(const char *s) {
     return s && mx_readable(s, 8);
 }
-// v1.5 白名单扫描：只枚举热更候选 image（Assembly-CSharp*/AotUpdate*），
-// 其余 AOT image（mscorlib/System/Unity*）一律不碰 —— 它们的类用 il2cpp_class_from_name 精确查询，
-// 且仅当该 image 的 typeCount 与游戏发布 metadata 一致（稳定态）才允许。
-static BOOL mx_hot_image(const char *inm) {
-    if (!inm) return NO;
-    return !strncmp(inm, "Assembly-CSharp", 15) && strcmp(inm, "Assembly-CSharp-firstpass.dll")
-        || !strncmp(inm, "AotUpdate", 9);
-}
+// v1.6 定位策略（枚举彻底死刑——.ips 两次实证 image_get_class 对 HybridCLR 热更 image 踩金丝雀）：
+//   热更逻辑类全部位于 Assembly-CSharp(.dll) 主 image（csharp_dump.txt 14309 类实证）。
+//   60s 门禁后 metadata 稳定，对热更 image 用 il2cpp_class_from_name 做【精确】查询是
+//   HybridCLR 官方支持路径（hook 后走标准 lookup，无 typeStart 越界/无 lazy 缓存写）。
+//   只有 Time 类去 UnityEngine.CoreModule 找。全程零枚举。
 static void *mx_scan_all(const char *ns, const char *name) {
     if (!ns) ns = "";
+    // 1) 主 image 精确查询（热更类全在这）
+    if (g_imgMain) {
+        void *c = mx_cls(g_imgMain, ns, name);
+        if (c) {
+            if (!strcmp(name, "BattleElementCenter")) g_imgBE = g_imgMain;
+            return c;
+        }
+    }
+    // 2) 兜底：逐 image class_from_name（精确查找，非枚举；稳定态安全）
     if (!mx_cache_images(NO)) return NULL;
-    if (!p_image_get_class_count || !p_image_get_class || !p_class_get_name) return NULL;
     for (size_t i = 0; i < g_imgCount; i++) {
         void *img = g_imgList[i];
         if (!img || !mx_readable(img, 0x40)) continue;
-        const char *inm = *(const char* const*)img;
-        if (!mx_name_safe(inm)) continue;
-        // 只枚举热更 image；系统/AOT image 走精确 class_from_name（它们启动即稳定）
-        BOOL hot = mx_hot_image(inm);
-        int32_t tStart = *(int32_t*)((char*)img + 0x18);
-        int32_t tCnt   = *(int32_t*)((char*)img + 0x20);
-        if (tCnt <= 0 || tCnt > 65536 || tStart < 0) continue;
-        if (hot) {
-            for (int k = 0; k < (int)tCnt; k++) {
-                void *cls = ((void*(*)(void*,int))p_image_get_class)(img, k);
-                if (!cls || !mx_readable(cls, 0x20)) continue;
-                const char *cn = ((const char*(*)(void*))p_class_get_name)(cls);
-                if (!mx_name_safe(cn) || strcmp(cn, name)) continue;
-                const char *cns = p_class_get_namespace ? ((const char*(*)(void*))p_class_get_namespace)(cls) : "";
-                if (!mx_name_safe(cns)) cns = "";
-                if (strcmp(cns, ns)) continue;
-                if (!strcmp(name, "BattleElementCenter")) g_imgBE = img;
-                return cls;
-            }
-        } else {
-            void *c = ((void*(*)(void*,const char*,const char*))p_class_from_name)(img, ns, name);
-            if (c) {
-                if (!strcmp(name, "BattleElementCenter")) g_imgBE = img;
-                return c;
-            }
+        void *c = mx_cls(img, ns, name);
+        if (c) {
+            if (!strcmp(name, "BattleElementCenter")) g_imgBE = img;
+            return c;
         }
     }
     return NULL;
@@ -394,6 +378,7 @@ static void *mx_unit_sa(void *u) {
 #pragma mark - 主 tick（主线程 1s）
 static void mx_tick(void) {
     @autoreleasepool {
+        @try {
         if (!g_resolved && !mx_resolve()) { g_status = 0; return; }
 
         // 战斗判定: BE._isOpen static bool（战斗系统已开启）
@@ -462,6 +447,9 @@ static void mx_tick(void) {
             if (g_mSetNoMiss)   mx_invoke(g_mSetNoMiss, NULL, (void*[]){mx_argb(YES)});
         }
         ui_refresh();
+        } @catch (NSException *e) {
+            mlog(@"tick exception: %@ %@", e.name, e.reason);
+        }
     }
 }
 
