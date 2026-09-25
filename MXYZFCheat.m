@@ -239,7 +239,7 @@ static BOOL mx_resolve(void) {
     }
     if (!g_phase2) { g_phase2 = YES; mlog(@"boot guard passed, scanning starts"); }
     g_resolveTry++;
-    if (g_resolveTry == 1 || g_resolveTry % 20 == 0) mlog(@"resolve try #%d", g_resolveTry);
+    if (g_resolveTry <= 5 || g_resolveTry % 10 == 0) mlog(@"resolve try #%d", g_resolveTry);
 
     if (!g_imgMain) {
         void *dom = ((void*(*)())p_domain_get)();
@@ -276,21 +276,33 @@ static BOOL mx_resolve(void) {
         if (!g_clsDropMgr) g_clsDropMgr = mx_scan_all(NULL, "BattleDropManager");
         if (!g_clsTime)  g_clsTime    = mx_scan_all("UnityEngine", "Time");
         if (!g_clsBE || !g_clsGOM) {
-            if (g_resolveTry % 20 == 0) {
-                mlog(@"cls miss be=%p gom=%p imgs=%zu", g_clsBE, g_clsGOM, g_imgCount);
+            // v1.7: 逐项诊断（每 5 轮 = 5s 一次）
+            if (g_resolveTry % 5 == 0) {
+                int32_t tc = -1, ts = -1;
+                if (g_imgMain && mx_readable(g_imgMain, 0x28)) {
+                    tc = *(int32_t*)((char*)g_imgMain + 0x20);
+                    ts = *(int32_t*)((char*)g_imgMain + 0x18);
+                }
+                mlog(@"miss r#%d: BE=%p GOM=%p | main img tc=%d ts=%d imgs=%zu",
+                     g_resolveTry, g_clsBE, g_clsGOM, tc, ts, g_imgCount);
+                // 直接试三个关键类（逐 image），打印哪个 image 能给出
+                void *t1 = g_imgMain ? mx_cls(g_imgMain, "ActionGameLibrary", "GameObjectManager") : NULL;
+                void *t2 = g_imgMain ? mx_cls(g_imgMain, "", "BattleDropManager") : NULL;
+                mlog(@"  probe: GOM(main)=%p BDM(main)=%p", t1, t2);
                 if (mx_cache_images(YES)) {
-                    NSMutableString *all = [NSMutableString string];
-                    for (size_t i = 0; i < g_imgCount; i++) {
+                    for (size_t i = 0; i < g_imgCount && i < 512; i++) {
                         void *im = g_imgList[i];
                         const char *nm2 = im ? ((const char*(*)(void*))p_image_get_name)(im) : NULL;
-                        int32_t tc = (im && mx_readable(im, 0x28)) ? *(int32_t*)((char*)im + 0x20) : -1;
-                        [all appendFormat:@"%s(%d) ", nm2 ?: "?", tc];
+                        if (!nm2) continue;
+                        // 只关注热更候选
+                        if (strncmp(nm2, "Assembly-CSharp", 15) && strncmp(nm2, "AotUpdate", 9)) continue;
+                        int32_t tcx = (im && mx_readable(im, 0x28)) ? *(int32_t*)((char*)im + 0x20) : -1;
+                        void *gx = mx_cls(im, "ActionGameLibrary", "GameObjectManager");
+                        mlog(@"  hot img: %s tc=%d GOM=%p", nm2, tcx, gx);
                     }
-                    mlog(@"images: %@", all);
                 }
             }
-            g_imgList = NULL;   // 强制下轮重建（等 HybridCLR 注册热更程序集）
-            g_imgMain = NULL;   // image 名 gate 失败也放行——直接走全扫描
+            g_imgList = NULL;
             return NO;
         }
         if (!g_clsIGO || !g_clsIGOData || !g_clsSecAttr || !g_clsDropMgr || !g_clsTime) {
