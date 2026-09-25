@@ -42,6 +42,8 @@ static void *p_field_get_offset, *p_field_static_get_value, *p_runtime_invoke;
 static void *p_object_get_class, *p_class_get_name;
 static void *p_image_get_class_count, *p_image_get_class, *p_class_get_namespace;
 static void *p_thread_attach;
+static void *p_class_get_methods, *p_class_get_fields, *p_method_get_name, *p_field_get_name;
+static void *p_method_get_param_count;
 
 static BOOL load_il2cpp_api(void) {
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
@@ -63,6 +65,11 @@ static BOOL load_il2cpp_api(void) {
     p_field_static_get_value     = dlsym(g_uf, "il2cpp_field_static_get_value");
     p_runtime_invoke             = dlsym(g_uf, "il2cpp_runtime_invoke");
     p_thread_attach              = dlsym(g_uf, "il2cpp_thread_attach");
+    p_class_get_methods          = dlsym(g_uf, "il2cpp_class_get_methods");
+    p_class_get_fields           = dlsym(g_uf, "il2cpp_class_get_fields");
+    p_method_get_name            = dlsym(g_uf, "il2cpp_method_get_name");
+    p_field_get_name             = dlsym(g_uf, "il2cpp_field_get_name");
+    p_method_get_param_count     = dlsym(g_uf, "il2cpp_method_get_param_count");
     p_object_get_class           = dlsym(g_uf, "il2cpp_object_get_class");
     p_class_get_name             = dlsym(g_uf, "il2cpp_class_get_name");
     p_image_get_class_count      = dlsym(g_uf, "il2cpp_image_get_class_count");
@@ -129,11 +136,46 @@ static void *mx_cls(void *img, const char *ns, const char *name) {
     if (diag) mlog(@"cls result[%d]: %p", g_diagQueries, r);
     return r;
 }
+// v2.0: 方法/字段定位改走官方迭代器（对热更类安全——get_method_from_name 内部哈希查找
+// 在 HybridCLR 方法表上有写路径，两次 .ips 同点位崩实证）。按名遍历比对。
 static void *mx_meth(void *cls, const char *m, int argc) {
-    return cls ? ((void*(*)(void*,const char*,int))p_class_get_method_from_name)(cls, m, argc) : NULL;
+    if (!cls || !p_class_get_methods || !p_method_get_name) {
+        if (cls && p_class_get_method_from_name)
+            return ((void*(*)(void*,const char*,int))p_class_get_method_from_name)(cls, m, argc);
+        return NULL;
+    }
+    size_t it = 0;
+    for (int guard = 0; guard < 4096; guard++) {
+        void *md = ((void*(*)(void*,size_t*))p_class_get_methods)(cls, &it);
+        if (!md) break;
+        const char *mn = ((const char*(*)(void*))p_method_get_name)(md);
+        if (mn && !strcmp(mn, m)) {
+            // 参数个数校验（可选）：argc<0 表示不校验
+            if (argc < 0) return md;
+            void *cnt = NULL;
+            if (p_method_get_param_count) {
+                int pc = ((int(*)(void*))p_method_get_param_count)(md);
+                if (pc == argc) return md;
+                continue;
+            }
+            return md;
+        }
+    }
+    return NULL;
 }
 static void *mx_fptr(void *cls, const char *fname) {
-    return cls ? ((void*(*)(void*,const char*))p_class_get_field_from_name)(cls, fname) : NULL;
+    if (!cls) return NULL;
+    if (p_class_get_fields && p_field_get_name) {
+        size_t it = 0;
+        for (int guard = 0; guard < 8192; guard++) {
+            void *fd = ((void*(*)(void*,size_t*))p_class_get_fields)(cls, &it);
+            if (!fd) break;
+            const char *fn = ((const char*(*)(void*))p_field_get_name)(fd);
+            if (fn && !strcmp(fn, fname)) return fd;
+        }
+        return NULL;
+    }
+    return ((void*(*)(void*,const char*))p_class_get_field_from_name)(cls, fname);
 }
 
 // 全 image 扫描：HybridCLR 热更类注册在运行时加载的 image（名带 .dll 后缀）
