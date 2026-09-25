@@ -61,6 +61,7 @@ static BOOL load_il2cpp_api(void) {
     p_field_get_offset           = dlsym(g_uf, "il2cpp_field_get_offset");
     p_field_static_get_value     = dlsym(g_uf, "il2cpp_field_static_get_value");
     p_runtime_invoke             = dlsym(g_uf, "il2cpp_runtime_invoke");
+    p_thread_attach              = dlsym(g_uf, "il2cpp_thread_attach");
     p_object_get_class           = dlsym(g_uf, "il2cpp_object_get_class");
     p_class_get_name             = dlsym(g_uf, "il2cpp_class_get_name");
     p_image_get_class_count      = dlsym(g_uf, "il2cpp_image_get_class_count");
@@ -116,11 +117,16 @@ static long  mx_box_long (void *b) { return b ? *(long*)((char*)b + 0x10) : 0; }
 static int   mx_box_int  (void *b) { return b ? *(int32_t*)((char*)b + 0x10) : 0; }
 static BOOL  mx_box_bool (void *b) { return b ? *(uint8_t*)((char*)b + 0x10) : 0; }
 
+static int g_diagQueries = 0;   // 诊断期查询计数（前 24 个查询打日志）
 static void *mx_cls(void *img, const char *ns, const char *name) {
     if (!img || !name) return NULL;
     // ⚠️ il2cpp_class_from_name 对 ns=NULL 会 strcmp 解引用崩溃 —— NULL 必须转空串
     if (!ns) ns = "";
-    return ((void*(*)(void*,const char*,const char*))p_class_from_name)(img, ns, name);
+    BOOL diag = g_diagQueries < 24;
+    if (diag) { g_diagQueries++; mlog(@"cls query[%d]: %s.%s @img=%p", g_diagQueries, ns, name, img); }
+    void *r = ((void*(*)(void*,const char*,const char*))p_class_from_name)(img, ns, name);
+    if (diag) mlog(@"cls result[%d]: %p", g_diagQueries, r);
+    return r;
 }
 static void *mx_meth(void *cls, const char *m, int argc) {
     return cls ? ((void*(*)(void*,const char*,int))p_class_get_method_from_name)(cls, m, argc) : NULL;
@@ -224,6 +230,9 @@ static void *g_mIGOData, *m_SetHPNow, *g_mGetHPMax, *g_mInvincible, *g_mGetCamp;
 static void *g_mSetPickAll, *g_mSetLocalDmg, *g_mSetNoMiss, *g_mTimeSet;
 static int g_resolveTry = 0;
 static BOOL g_resolved = NO;
+static BOOL g_bgStarted = NO;
+static int g_bgTries = 0;
+static void *p_thread_attach = NULL;
 static uint64_t g_bootMs = 0;   // 注入时刻
 static BOOL g_phase2 = NO;      // 60s 后进入安全扫描期
 
@@ -391,7 +400,27 @@ static void *mx_unit_sa(void *u) {
 static void mx_tick(void) {
     @autoreleasepool {
         @try {
-        if (!g_resolved && !mx_resolve()) { g_status = 0; return; }
+        // v1.8: resolve 全部在后台线程执行（class_from_name 首查热更 image 疑似与主循环死锁，
+        // 主线程 onTick 里跑会把游戏 UI 一起冻住——日志止于 try#1 实证）
+        if (!g_resolved) {
+            if (!g_bgStarted) {
+                g_bgStarted = YES;
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                    // il2cpp 官方支持：任意线程反射前 attach
+                    if (p_thread_attach) ((void*(*)(void*))p_thread_attach)(((void*(*)())p_domain_get)());
+                    mlog(@"bg resolve thread start");
+                    while (!g_resolved && g_bgTries < 120) {
+                        g_bgTries++;
+                        if (mx_resolve()) break;
+                        [NSThread sleepForTimeInterval:2.0];
+                    }
+                    if (g_resolved) { g_status = 1; mlog(@"bg resolve done"); }
+                    else mlog(@"bg resolve giveup after %d tries", g_bgTries);
+                });
+            }
+            g_status = 0;
+            return;
+        }
 
         // 战斗判定: BE._isOpen static bool（战斗系统已开启）
         BOOL inBattle = NO;
