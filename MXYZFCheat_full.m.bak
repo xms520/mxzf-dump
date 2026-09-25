@@ -1,0 +1,213 @@
+// MXYZFCheat.m — 冒险与征途 3.0.6 (com.drsy.ios) Unity 2022.3.14f1 IL2CPP + HybridCLR
+// 秒杀 / 无敌 / 全局加速 / 自动拾取 / 本地免伤调试开关 — 纯 il2cpp 导出 API 反射 invoke，零 RVA hook
+//
+// 挂点链（全部 Assembly-CSharp.dll 热更层实证，见 csharp_dump.txt）：
+//   BattleElementCenter.gameObjectManager  [STATIC 字段] → GameObjectManager(战斗单位管理器)
+//   GOM._unitList(List<IActionGameObject>: _items@0x10 _size@0x18 数据@0x20) → 全部战斗单位
+//   GOM._player → 主角 SimpleCharacter；GOM.IsPlayerCamp(u)/IsOwnPlayer(u) → 敌我判定
+//   单位继承链: Character→SimpleCharacter→ActiveGameObject→PassiveGameObject→InteractiveGameObject
+//   IGO.get_interactiveGameObjectData() → IGOData.secondaryAttribute(字段) → SecondaryAttribute
+//   秒杀: 敌方 SA.set_healthPointNow(0)（引擎 CheckDead 自然死亡，掉落/结算全真）
+//   无敌: 己方 SA.set_healthPointNow(maxHp) 锁血 + IGO.Invincible(f,bool) 官方无敌
+//   加速: UnityEngine.Time.set_timeScale(float)（引擎级全局）
+//   拾取: BattleDropManager.set_PickAll(true) [STATIC 官方一键拾取]
+//   调试: BattleElementCenter.set_localDamage(f)/set_localNoMiss(b) [STATIC 官方本地调试]
+// 日志: Documents/mxzf.log
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <stdatomic.h>
+
+static FILE *g_log = NULL;
+static void mlog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
+static void mlog(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSLog(@"[MXZF] %@", s);
+    if (!g_log) {
+        NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/mxzf.log"];
+        g_log = fopen(p.UTF8String, "a");
+    }
+    if (g_log) { fprintf(g_log, "[MXZF] %s\n", s.UTF8String); fflush(g_log); }
+}
+
+#pragma mark - 主 tick（纯 UI，无功能）
+static void mx_tick(void) { /* 无功能版 */ }
+
+#pragma mark - UI
+#define TAG_BALL  978001
+#define TAG_PANEL 978002
+#define TAG_ST    978003
+#define TAG_MASK  978004
+static UILabel *g_statusLabel = nil;
+static UIButton *g_bKill = nil, *g_bInv = nil, *g_bSpd = nil, *g_bPick = nil, *g_bDbg = nil;
+static void ui_toggle_panel(void);
+static void mx_make_ui(void);
+
+static UIColor *mx_color(int r, int g, int b, float a) {
+    return [UIColor colorWithRed:r/255.0 green:g/255.0 blue:b/255.0 alpha:a];
+}
+static UIButton *mx_btn(NSString *title) {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.layer.cornerRadius = 8;
+    b.layer.borderWidth = 1;
+    b.layer.borderColor = mx_color(90, 160, 255, 0.6).CGColor;
+    b.backgroundColor = mx_color(28, 30, 40, 0.95);
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    [b setTitleColor:mx_color(220, 225, 235, 1) forState:UIControlStateNormal];
+    [b setTitle:title forState:UIControlStateNormal];
+    return b;
+}
+static void mx_set_on(UIButton *b, BOOL on) {
+    b.backgroundColor = on ? mx_color(24, 110, 60, 0.95) : mx_color(28, 30, 40, 0.95);
+    b.layer.borderColor = (on ? mx_color(60, 220, 130, 0.9) : mx_color(90, 160, 255, 0.6)).CGColor;
+}
+static void ui_refresh(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!g_bKill) return;
+        [g_bKill setTitle:[NSString stringWithFormat:@"秒杀  %@", atomic_load(&g_kill) ? @"开" : @"关"] forState:UIControlStateNormal];
+        [g_bInv  setTitle:[NSString stringWithFormat:@"无敌  %@", atomic_load(&g_inv) ? @"开" : @"关"] forState:UIControlStateNormal];
+        [g_bSpd  setTitle:[NSString stringWithFormat:@"加速  %gx", SPD_N[atomic_load(&g_spd)]] forState:UIControlStateNormal];
+        [g_bPick setTitle:[NSString stringWithFormat:@"拾取  %@", atomic_load(&g_pick) ? @"开" : @"关"] forState:UIControlStateNormal];
+        [g_bDbg  setTitle:[NSString stringWithFormat:@"免伤  %@", atomic_load(&g_dbg) ? @"开" : @"关"] forState:UIControlStateNormal];
+        mx_set_on(g_bKill, atomic_load(&g_kill));
+        mx_set_on(g_bInv,  atomic_load(&g_inv));
+        mx_set_on(g_bSpd,  g_spd > 0);
+        mx_set_on(g_bPick, atomic_load(&g_pick));
+        mx_set_on(g_bDbg,  atomic_load(&g_dbg));
+        NSString *st;
+        if (g_status == 0)      st = @"状态：等待热更加载…";
+        else if (g_status == 1) st = @"状态：就绪，进战斗生效";
+        else {
+            NSMutableString *m = [NSMutableString stringWithString:@"战斗中"];
+            if (atomic_load(&g_kill) && g_lastKilled) [m appendFormat:@" 秒%d", g_lastKilled];
+            if (atomic_load(&g_inv) && g_lastLocked) [m appendFormat:@" 锁%d", g_lastLocked];
+            st = m;
+        }
+        g_statusLabel.text = st;
+    });
+}
+static void ui_toggle_panel(void) {
+    UIWindow *w = [UIApplication sharedApplication].keyWindow ?: [UIApplication sharedApplication].windows.firstObject;
+    UIView *p = [w viewWithTag:TAG_PANEL];
+    if (p) {
+        [[w viewWithTag:TAG_MASK] removeFromSuperview];
+        [p removeFromSuperview];
+        return;
+    }
+    CGFloat pw = 224, ph = 286;
+    UIView *mask = [[UIView alloc] initWithFrame:w.bounds];
+    mask.tag = TAG_MASK;
+    mask.backgroundColor = [UIColor clearColor];
+    mask.userInteractionEnabled = YES;
+    [mask addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:[MXBox shared] action:@selector(tapMask)]];
+
+    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(16, 70, pw, ph)];
+    panel.tag = TAG_PANEL;
+    panel.layer.cornerRadius = 14;
+    panel.backgroundColor = mx_color(14, 16, 24, 0.92);
+    panel.layer.borderColor = mx_color(70, 140, 255, 0.5).CGColor;
+    panel.layer.borderWidth = 1;
+    panel.userInteractionEnabled = YES;
+    [panel addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:[MXBox shared] action:@selector(noop)]];
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 8, pw, 20)];
+    title.text = @"✦ 征途助手 ✦";
+    title.textColor = mx_color(120, 200, 255, 1);
+    title.font = [UIFont boldSystemFontOfSize:15];
+    title.textAlignment = NSTextAlignmentCenter;
+    [panel addSubview:title];
+
+    void (^mk)(int, NSString *, void (^)()) = ^(int row, NSString *t, void (^act)()) {
+        UIButton *b = mx_btn(t);
+        b.frame = CGRectMake(12, 34 + row * 40, pw - 24, 34);
+        [panel addSubview:b];
+        act(b);
+    };
+    mk(0, @"秒杀  关", ^(UIButton *b){ g_bKill = b;
+        [b addTarget:[MXBox shared] action:@selector(tapKill) forControlEvents:UIControlEventTouchUpInside]; });
+    mk(1, @"无敌  关", ^(UIButton *b){ g_bInv = b;
+        [b addTarget:[MXBox shared] action:@selector(tapInv) forControlEvents:UIControlEventTouchUpInside]; });
+    mk(2, @"加速  1x", ^(UIButton *b){ g_bSpd = b;
+        [b addTarget:[MXBox shared] action:@selector(tapSpd) forControlEvents:UIControlEventTouchUpInside]; });
+    mk(3, @"拾取  关", ^(UIButton *b){ g_bPick = b;
+        [b addTarget:[MXBox shared] action:@selector(tapPick) forControlEvents:UIControlEventTouchUpInside]; });
+    mk(4, @"免伤  关", ^(UIButton *b){ g_bDbg = b;
+        [b addTarget:[MXBox shared] action:@selector(tapDbg) forControlEvents:UIControlEventTouchUpInside]; });
+    g_statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, ph - 24, pw - 20, 16)];
+    g_statusLabel.tag = TAG_ST;
+    g_statusLabel.textColor = mx_color(150, 160, 175, 1);
+    g_statusLabel.font = [UIFont systemFontOfSize:10];
+    g_statusLabel.textAlignment = NSTextAlignmentCenter;
+    [panel addSubview:g_statusLabel];
+
+    [w addSubview:mask];
+    [w addSubview:panel];
+    UIView *ball = [w viewWithTag:TAG_BALL];
+    if (ball) [w bringSubviewToFront:ball];
+    ui_refresh();
+}
+static void mx_make_ui(void) {
+    UIWindow *w = [UIApplication sharedApplication].keyWindow ?: [UIApplication sharedApplication].windows.firstObject;
+    if (!w) { dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ mx_make_ui(); }); return; }
+    if ([w viewWithTag:TAG_BALL]) return;
+    UIButton *ball = [UIButton buttonWithType:UIButtonTypeCustom];
+    ball.tag = TAG_BALL;
+    ball.frame = CGRectMake(w.bounds.size.width - 76, 150, 48, 48);
+    ball.backgroundColor = mx_color(20, 24, 36, 0.85);
+    ball.layer.cornerRadius = 24;
+    ball.layer.borderWidth = 1.5;
+    ball.layer.borderColor = mx_color(80, 170, 255, 0.9).CGColor;
+    [ball setTitle:@"征" forState:UIControlStateNormal];
+    ball.titleLabel.font = [UIFont boldSystemFontOfSize:19];
+    [ball setTitleColor:mx_color(130, 210, 255, 1) forState:UIControlStateNormal];
+    [ball addTarget:[MXBox shared] action:@selector(tapBall) forControlEvents:UIControlEventTouchUpInside];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:[MXBox shared] action:@selector(dragBall:)];
+    [ball addGestureRecognizer:pan];
+    [w addSubview:ball];
+    mlog(@"UI ready");
+}
+
+#pragma mark - 事件盒
+@implementation MXBox
++ (instancetype)shared { static MXBox *b; static dispatch_once_t o; dispatch_once(&o, ^{ b = [self new]; }); return b; }
+- (void)noop {}
+- (void)tapMask { ui_toggle_panel(); }
+- (void)tapKill { atomic_fetch_xor(&g_kill, 1); mlog(@"kill -> %d", atomic_load(&g_kill)); ui_refresh(); }
+- (void)tapInv  { atomic_fetch_xor(&g_inv, 1);  mlog(@"inv -> %d",  atomic_load(&g_inv));  ui_refresh(); }
+- (void)tapSpd  { int nv = (atomic_load(&g_spd) + 1) % 4; atomic_store(&g_spd, nv); mlog(@"spd -> %gx", SPD_N[nv]); ui_refresh(); }
+- (void)tapPick { atomic_fetch_xor(&g_pick, 1); mlog(@"pick -> %d", atomic_load(&g_pick)); ui_refresh(); }
+- (void)tapDbg  { atomic_fetch_xor(&g_dbg, 1);  mlog(@"dbg -> %d",  atomic_load(&g_dbg));  ui_refresh(); }
+- (void)tapBall { ui_toggle_panel(); }
+- (void)dragBall:(UIPanGestureRecognizer *)g {
+    UIView *v = g.view;
+    CGPoint t = [g translationInView:v.superview];
+    v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
+    [g setTranslation:CGPointZero inView:v.superview];
+}
+- (void)onTick { mx_tick(); }
+@end
+
+#pragma mark - 启动
+static NSTimer *g_timer = NULL;
+static void mx_start_timer(void) {
+    if (g_timer) return;
+    g_timer = [NSTimer timerWithTimeInterval:1.0 target:[MXBox shared] selector:@selector(onTick) userInfo:nil repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:g_timer forMode:NSRunLoopCommonModes];
+    mlog(@"timer started");
+}
+__attribute__((constructor)) static void mxzf_ctor(void) {
+    @autoreleasepool {
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"?";
+        mlog(@"ctor pid=%d bid=%@", getpid(), bid);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!load_il2cpp_api()) { mlog(@"UnityFramework 未加载，静默退出"); return; }
+            mlog(@"il2cpp api ok");
+            mx_start_timer();
+            mx_make_ui();
+        });
+    }
+}
