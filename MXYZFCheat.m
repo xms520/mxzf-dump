@@ -216,6 +216,8 @@ static BOOL mx_name_safe(const char *s) {
     return s && mx_readable(s, 8);
 }
 static void *g_imgMain = NULL;
+static BOOL g_stageA = NO;
+static BOOL g_stageB = NO;
 // v1.6 定位策略（枚举彻底死刑——.ips 两次实证 image_get_class 对 HybridCLR 热更 image 踩金丝雀）：
 //   热更逻辑类全部位于 Assembly-CSharp(.dll) 主 image（csharp_dump.txt 14309 类实证）。
 //   60s 门禁后 metadata 稳定，对热更 image 用 il2cpp_class_from_name 做【精确】查询是
@@ -286,7 +288,15 @@ static int g_bgTries = 0;
 static uint64_t g_bootMs = 0;   // 注入时刻
 static BOOL g_phase2 = NO;      // 60s 后进入安全扫描期
 
+static BOOL mx_resolve_stageA(void);
+static BOOL mx_resolve_stageB(void);
+
+// 阶段调度入口
 static BOOL mx_resolve(void) {
+    if (!g_stageA) return mx_resolve_stageA();
+    return NO;
+}
+static BOOL mx_resolve_stageA(void) {
     // v1.5 门禁：启动 60s 内 il2cpp 全局 metadata 在 HybridCLR 初始化中变化，
     // 枚举任何 image 都可能踩坏栈（v1.3/v1.4 .ips 实证）。60s 后游戏已进主城，热更 dll 必已加载。
     if (g_bootMs == 0) g_bootMs = (uint64_t)([[NSProcessInfo processInfo] systemUptime] * 1000.0);
@@ -371,7 +381,15 @@ static BOOL mx_resolve(void) {
         }
         mlog(@"classes resolved: BE in image %s", ((const char*(*)(void*))p_image_get_name)(g_imgBE) ?: "?");
     }
+    g_stageA = YES;
+    return YES;
+}
 
+// 阶段B（主线程）: 方法/字段定位 —— class_get_methods 内部锁与主线程互斥，
+// bg 线程调用会永久阻塞（v2.0/v2.1 卡死实证），必须在主线程执行
+static BOOL mx_resolve_stageB(void) {
+    g_resolveTry++;
+    if (g_resolveTry <= 10 || g_resolveTry % 5 == 0) mlog(@"stageB try #%d", g_resolveTry);
     g_fGOM        = mx_fptr(g_clsBE, "gameObjectManager");   // STATIC GameObjectManager
     g_fIsOpen     = mx_fptr(g_clsBE, "_isOpen");             // STATIC bool
     g_mGetIsInBattle = mx_meth(g_clsBE, "get_isInBattle", 0);// STATIC
@@ -407,8 +425,9 @@ static BOOL mx_resolve(void) {
     // v1.9: static 探针失败不放弃——热更类 static 分配时机不同，等主循环用 invoke 路径兜底
     if (g_resolveTry <= 3) mlog(@"r#%d tail2: staticSafe GOM=%d isOpen=%d", g_resolveTry, mx_static_safe(g_fGOM), mx_static_safe(g_fIsOpen));
 
+    g_stageB = YES;
     g_resolved = YES;
-    mlog(@"resolve OK try#%d", g_resolveTry);
+    mlog(@"resolve OK (stageB try#%d)", g_resolveTry);
     return YES;
 }
 
@@ -453,23 +472,27 @@ static void mx_tick(void) {
         // v1.8: resolve 全部在后台线程执行（class_from_name 首查热更 image 疑似与主循环死锁，
         // 主线程 onTick 里跑会把游戏 UI 一起冻住——日志止于 try#1 实证）
         if (!g_resolved) {
+            // 阶段A（bg 线程）: 类查询
             if (!g_bgStarted) {
                 g_bgStarted = YES;
                 dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                    // il2cpp 官方支持：任意线程反射前 attach
                     if (p_thread_attach) ((void*(*)(void*))p_thread_attach)(((void*(*)())p_domain_get)());
                     mlog(@"bg resolve thread start");
-                    while (!g_resolved && g_bgTries < 120) {
+                    while (!g_stageA && g_bgTries < 120) {
                         g_bgTries++;
-                        if (mx_resolve()) break;
+                        mx_resolve();
                         [NSThread sleepForTimeInterval:2.0];
                     }
-                    if (g_resolved) { g_status = 1; mlog(@"bg resolve done"); }
-                    else mlog(@"bg resolve giveup after %d tries", g_bgTries);
+                    if (g_stageA) mlog(@"bg stageA done");
+                    else mlog(@"bg stageA giveup (%d tries)", g_bgTries);
                 });
             }
-            g_status = 0;
-            return;
+            // 阶段B（主线程）: 方法/字段定位
+            if (g_stageA && !g_stageB) {
+                if (mx_resolve_stageB()) { g_status = 1; mlog(@"bg resolve done"); }
+                else { g_status = 0; return; }
+            }
+            if (!g_resolved) { g_status = 0; return; }
         }
 
         // 战斗判定: BE.get_isInBattle() static invoke（唯一路径——static 直读对热更类不安全）
