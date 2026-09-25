@@ -158,6 +158,7 @@ static BOOL mx_cache_images(BOOL rebuild) {
 static BOOL mx_name_safe(const char *s) {
     return s && mx_readable(s, 8);
 }
+static void *g_imgMain = NULL;
 // v1.6 定位策略（枚举彻底死刑——.ips 两次实证 image_get_class 对 HybridCLR 热更 image 踩金丝雀）：
 //   热更逻辑类全部位于 Assembly-CSharp(.dll) 主 image（csharp_dump.txt 14309 类实证）。
 //   60s 门禁后 metadata 稳定，对热更 image 用 il2cpp_class_from_name 做【精确】查询是
@@ -215,7 +216,6 @@ static void *mx_argb(BOOL v)  { uint8_t *p = &g_ab[g_abn++ & 15]; *p = v ? 1 : 0
 static void ui_refresh(void);
 
 #pragma mark - 解析缓存
-static void *g_imgMain;
 static void *g_clsBE, *g_clsGOM, *g_clsIGO, *g_clsIGOData, *g_clsSecAttr, *g_clsDropMgr;
 static void *g_clsTime;
 static void *g_fGOM, *g_fIsOpen;
