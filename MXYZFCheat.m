@@ -44,6 +44,7 @@ static void *p_image_get_class_count, *p_image_get_class, *p_class_get_namespace
 static void *p_thread_attach;
 static void *p_class_get_methods, *p_class_get_fields, *p_method_get_name, *p_field_get_name;
 static void *p_method_get_param_count;
+static int g_iterDiag = 0;
 
 static BOOL load_il2cpp_api(void) {
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
@@ -145,17 +146,24 @@ static void *mx_meth(void *cls, const char *m, int argc) {
         return NULL;
     }
     size_t it = 0;
+    void *first = ((void*(*)(void*,size_t*))p_class_get_methods)(cls, &it);
+    if (!first && g_iterDiag < 6) {
+        g_iterDiag++;
+        const char *cn = p_class_get_name ? ((const char*(*)(void*))p_class_get_name)(cls) : "?";
+        mlog(@"iter probe: get_methods(%s) first=NULL (method table empty?)", cn ?: "?");
+        return NULL;
+    }
     for (int guard = 0; guard < 4096; guard++) {
-        void *md = ((void*(*)(void*,size_t*))p_class_get_methods)(cls, &it);
+        void *md = (guard == 0) ? first : ((void*(*)(void*,size_t*))p_class_get_methods)(cls, &it);
         if (!md) break;
         const char *mn = ((const char*(*)(void*))p_method_get_name)(md);
         if (mn && !strcmp(mn, m)) {
             // 参数个数校验（可选）：argc<0 表示不校验
             if (argc < 0) return md;
-            void *cnt = NULL;
             if (p_method_get_param_count) {
                 int pc = ((int(*)(void*))p_method_get_param_count)(md);
                 if (pc == argc) return md;
+                if (g_iterDiag < 12) { g_iterDiag++; mlog(@"meth %s: name match but pc=%d want=%d", m, pc, argc); }
                 continue;
             }
             return md;
@@ -290,7 +298,7 @@ static BOOL mx_resolve(void) {
     }
     if (!g_phase2) { g_phase2 = YES; mlog(@"boot guard passed, scanning starts"); }
     g_resolveTry++;
-    if (g_resolveTry <= 5 || g_resolveTry % 10 == 0) mlog(@"resolve try #%d", g_resolveTry);
+    if (g_resolveTry <= 10 || g_resolveTry % 5 == 0) mlog(@"resolve try #%d", g_resolveTry);
 
     if (!g_imgMain) {
         void *dom = ((void*(*)())p_domain_get)();
