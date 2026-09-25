@@ -73,7 +73,7 @@ static UIView *mx_rainbow_ball(CGFloat size) {
     CGPathAddEllipseInRect(p, NULL, CGRectMake(0, 0, size, size));
     CGPathAddEllipseInRect(p, NULL, CGRectMake((size-hole)/2, (size-hole)/2, hole, hole));
     mask.path = p;
-    mask.fillRule = kCAFillRuleEvenOdd;
+    mask.fillRule = (CAFillRule)1; // kCAFillRuleEvenOdd
     CGPathRelease(p);
     grad.mask = mask;
 
