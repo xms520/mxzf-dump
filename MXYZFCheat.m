@@ -328,8 +328,10 @@ static BOOL mx_resolve(void) {
     g_mUnitList   = mx_meth(g_clsGOM, "GetUnitList", 0);     // inst → List
     g_mIsPlayerCamp = mx_meth(g_clsGOM, "IsPlayerCamp", 1);  // inst
     g_mIsOwnPlayer  = mx_meth(g_clsGOM, "IsOwnPlayer", 1);   // inst
+    if (g_resolveTry <= 3) mlog(@"r#%d tail1: fGOM=%p inbt=%p ul=%p pc=%p own=%p", g_resolveTry, g_fGOM, g_mGetIsInBattle, g_mUnitList, g_mIsPlayerCamp, g_mIsOwnPlayer);
     if (!g_fGOM || !g_mGetIsInBattle || !g_mUnitList || !g_mIsPlayerCamp) {
-        if (g_resolveTry % 20 == 0) mlog(@"gom meth miss fGOM=%p inbt=%p ul=%p pc=%p", g_fGOM, g_mGetIsInBattle, g_mUnitList, g_mIsPlayerCamp);
+        mlog(@"gom meth miss fGOM=%p inbt=%p ul=%p pc=%p", g_fGOM, g_mGetIsInBattle, g_mUnitList, g_mIsPlayerCamp);
+        g_imgList = NULL;
         return NO;
     }
 
@@ -352,10 +354,8 @@ static BOOL mx_resolve(void) {
         return NO;
     }
 
-    if (!mx_static_safe(g_fGOM) || !mx_static_safe(g_fIsOpen)) {
-        if (g_resolveTry % 20 == 0) mlog(@"static fields not ready");
-        return NO;
-    }
+    // v1.9: static 探针失败不放弃——热更类 static 分配时机不同，等主循环用 invoke 路径兜底
+    if (g_resolveTry <= 3) mlog(@"r#%d tail2: staticSafe GOM=%d isOpen=%d", g_resolveTry, mx_static_safe(g_fGOM), mx_static_safe(g_fIsOpen));
 
     g_resolved = YES;
     mlog(@"resolve OK try#%d", g_resolveTry);
@@ -422,23 +422,18 @@ static void mx_tick(void) {
             return;
         }
 
-        // 战斗判定: BE._isOpen static bool（战斗系统已开启）
+        // 战斗判定: BE.get_isInBattle() static invoke（唯一路径——static 直读对热更类不安全）
         BOOL inBattle = NO;
         void *isOpenBox = mx_invoke2(g_mGetIsInBattle, NULL);
         if (isOpenBox) inBattle = mx_box_bool(isOpenBox);
-        // _isOpen 直读兜底
-        if (!inBattle) {
-            // static field value
-            char tmp[16] = {0};
-            ((void(*)(void*,void*))p_field_static_get_value)(g_fIsOpen, tmp);
-            inBattle = tmp[0] != 0;
-        }
         g_status = inBattle ? 2 : 1;
         if (!inBattle) { ui_refresh(); return; }
 
-        // GOM 实例（静态字段直读）
+        // GOM 实例（静态字段读取——热更类 static_fields 布局与 AOT 相同，探针保护）
         void *gom = NULL;
-        ((void(*)(void*,void*))p_field_static_get_value)(g_fGOM, &gom);
+        if (mx_static_safe(g_fGOM)) {
+            ((void(*)(void*,void*))p_field_static_get_value)(g_fGOM, &gom);
+        }
         if (!gom || !mx_readable(gom, 0x60)) return;
 
         // 全部单位
